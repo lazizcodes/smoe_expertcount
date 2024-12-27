@@ -312,7 +312,68 @@ class FMoE(nn.Module):
                 return tensor
 
             moe_outp = tree.map_structure(view_func, fwd)
+        
+        # Group outputs by experts
+        def construct_outp_by_expert(moe_outp, gate_top_k_idx, num_expert):
+            """
+            Constructs outp_by_expert from moe_outp.
 
+            Args:
+                moe_outp (Tensor): Shape (batch_size, top_k, d_model), expert outputs for each token.
+                gate_top_k_idx (Tensor): Shape (batch_size, top_k), indices of routed experts.
+                num_expert (int): Total number of experts.
+
+            Returns:
+                outp_by_expert (Tensor): Shape (num_expert, batch_size, d_model), outputs grouped by expert.
+            """
+            batch_size, top_k, d_model = moe_outp.shape
+            # Initialize outp_by_expert with zeros (or another placeholder)
+            outp_by_expert = torch.zeros((num_expert, batch_size, d_model), device=moe_outp.device)
+            
+            # Mask to indicate unused token slots for each expert
+            mask = torch.zeros((num_expert, batch_size), dtype=torch.bool, device=moe_outp.device)
+            
+            # Populate outp_by_expert
+            for token_idx in range(batch_size):
+                for expert_idx, expert_id in enumerate(gate_top_k_idx[token_idx]):
+                    outp_by_expert[expert_id, token_idx] = moe_outp[token_idx, expert_idx]
+                    mask[expert_id, token_idx] = True  # Mark this slot as used
+            
+            # Set unused slots to None (or keep zeros if preferred)
+            outp_by_expert[~mask] = 0  # Use 0 as placeholder for unused slots
+
+            return outp_by_expert
+        
+        # DEFINE outp_by_expert
+        outp_by_expert = construct_outp_by_expert(moe_outp, gate_top_k_idx, self.num_expert)
+
+
+        # INIT: tensor F of shape (E, E), fill with zeros first
+        F = torch.zeros(self.num_expert, self.num_expert)
+
+        # POPULATE: F_ij = E[f_i(h)^T f_j(h)] as follows:
+        for i in range(self.num_expert):
+            for j in range(i, self.num_expert):  # Exploit symmetry of F
+                # Step 1: Extract outputs for experts i and j
+                # f_i and f_j are tensors of shape (b_size, d_model) for the i-th and j-th experts
+                f_i = outp_by_expert[i]  # Shape: (b_size, d_model)
+                f_j = outp_by_expert[j]  # Shape: (b_size, d_model)
+
+                # Step 2: Compute row-wise dot product
+                # A token is valid if its norm is greater than zero
+                valid_mask = (f_i.norm(dim=1) > 0) & (f_j.norm(dim=1) > 0)  # Shape: (b_size,)
+                dot_products = torch.einsum('nd,nd->n', f_i, f_j)  # Shape: (b_size,)
+
+                # Step 3: Apply the mask and compute the mean
+                valid_dot_products = dot_products[valid_mask]
+                average_dot_product = valid_dot_products.mean() if valid_dot_products.numel() > 0 else 0.0
+
+                # Step 4: Update F_ij and exploit symmetry
+                F[i, j] = average_dot_product
+                if i != j:
+                    F[j, i] = F[i, j]
+
+        # Now proceed with mixing
         gate_score = gate_score.view(-1, 1, self.top_k)
         
         def bmm_func(tensor): # recombine expert outputs according to gate scores
