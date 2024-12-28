@@ -313,15 +313,156 @@ class FMoE(nn.Module):
 
             moe_outp = tree.map_structure(view_func, fwd)
 
+        ##### RetroMoE #####
+
+        def compute_q_star_closed_form(F_matrices, epsilon=1e-6):
+            """
+            Compute q* for all F_matrices in the batch using the closed-form solution.
+            Args:
+                F_matrices: Tensor of shape (batch_size, top_k, top_k), pairwise similarity matrices.
+                epsilon: Small constant added to the diagonal for numerical stability.
+            Returns:
+                q_star: Tensor of shape (batch_size, top_k), optimized gate scores for all tokens.
+            """
+            batch_size, top_k, _ = F_matrices.shape
+
+            # Add epsilon to the diagonal to ensure F is invertible
+            F_perturbed = F_matrices + epsilon * torch.eye(top_k, device=F_matrices.device).unsqueeze(0)
+
+            # Compute F^{-1} (batch-wise matrix inverse)
+            F_inv = torch.linalg.inv(F_perturbed)  # Shape: (batch_size, top_k, top_k)
+
+            # Compute F^{-1} * 1 (vector of ones)
+            ones = torch.ones(top_k, 1, device=F_matrices.device)  # Shape: (top_k, 1)
+            F_inv_ones = torch.bmm(F_inv, ones)  # Shape: (batch_size, top_k, 1)
+
+            # Compute 1^T * F^{-1} * 1 (normalization factor)
+            normalization = torch.bmm(ones.transpose(0, 1), F_inv_ones).squeeze(-1).squeeze(-1)  # Shape: (batch_size,)
+
+            # Compute q* (batch-wise)
+            q_star = (F_inv_ones / normalization.unsqueeze(-1)).squeeze(-1)  # Shape: (batch_size, top_k)
+
+            return q_star
+
+        # Compute F(h) and q* for moe_outp
+        def compute_F_and_q_star(tensor, gate_scores):
+            """
+            Compute F(h) using the gate scores and expert outputs, then calculate q*.
+            Args:
+                tensor: Tensor of shape (batch_size, top_k, dim), expert outputs for each token.
+                gate_scores: Tensor of shape (batch_size, top_k), gate scores g_k for each token.
+            Returns:
+                q_star: Tensor of shape (batch_size, top_k), optimized gate scores for all tokens.
+            """
+            # Expand gate scores to compute g_i * g_j
+            gate_scores_expanded = gate_scores.unsqueeze(2) * gate_scores.unsqueeze(1)  # Shape: (batch_size, top_k, top_k)
+
+            # Compute pairwise similarities weighted by gate scores
+            F = torch.einsum("b k d, b l d -> b k l", tensor, tensor)  # Shape: (batch_size, top_k, top_k)
+            F = F * gate_scores_expanded  # Incorporate gate scores
+
+            # Compute q* using the closed-form solution
+            q_star = compute_q_star_closed_form(F, epsilon=1e-6)
+
+            return q_star
+
+        # Compute q* for all moe_outp tensors
+        def compute_token_q_star(moe_outp, gate_scores):
+            """
+            Wrapper to compute q* for all moe_outp tensors using gate scores.
+            Args:
+                moe_outp: Tree-structured expert outputs.
+                gate_scores: Tensor of shape (batch_size, top_k), gate scores.
+            Returns:
+                token_q_star: Tree-structured q* scores for each token.
+            """
+            def compute_q_star_func(tensor):
+                return compute_F_and_q_star(tensor, gate_scores)
+
+            return tree.map_structure(compute_q_star_func, moe_outp)
+
+        # Compute q* for all tokens
+        token_q_star = compute_token_q_star(moe_outp, gate_score)
+
+        ###############
+
+        # Now proceed with mixing
         gate_score = gate_score.view(-1, 1, self.top_k)
-        
-        def bmm_func(tensor): # recombine expert outputs according to gate scores
+
+        def bmm_func(tensor, q_star):  # Recombine expert outputs according to gate scores and q*
             dim = tensor.shape[-1]
-            tensor = torch.bmm(gate_score, tensor).reshape(-1, dim)
+            combined_scores = (q_star.unsqueeze(-1) * gate_score).squeeze(1)  # Combine q* and g_k
+            tensor = torch.bmm(combined_scores, tensor).reshape(-1, dim)
             return tensor
+
+        # Apply bmm_func using token_q_star
+        moe_outp = tree.map_structure(bmm_func, moe_outp, token_q_star)
+        
+        # ##### RetroMoE #####
+
+        # def compute_q_star_closed_form(F_matrices, epsilon=1e-6):
+        #     """
+        #     Compute q* for all F_matrices in the batch using the closed-form solution.
+        #     Args:
+        #         F_matrices: Tensor of shape (batch_size, top_k, top_k), pairwise similarity matrices.
+        #         epsilon: Small constant added to the diagonal for numerical stability.
+        #     Returns:
+        #         q_star: Tensor of shape (batch_size, top_k), optimized gate scores for all tokens.
+        #     """
+        #     batch_size, top_k, _ = F_matrices.shape
+
+        #     # Add epsilon to the diagonal to ensure F is invertible
+        #     F_perturbed = F_matrices + epsilon * torch.eye(top_k, device=F_matrices.device).unsqueeze(0)
+
+        #     # Compute F^{-1} (batch-wise matrix inverse)
+        #     F_inv = torch.linalg.inv(F_perturbed)  # Shape: (batch_size, top_k, top_k)
+
+        #     # Compute F^{-1} * 1 (vector of ones)
+        #     ones = torch.ones(top_k, 1, device=F_matrices.device)  # Shape: (top_k, 1)
+        #     F_inv_ones = torch.bmm(F_inv, ones)  # Shape: (batch_size, top_k, 1)
+
+        #     # Compute 1^T * F^{-1} * 1 (normalization factor)
+        #     normalization = torch.bmm(ones.transpose(0, 1), F_inv_ones).squeeze(-1).squeeze(-1)  # Shape: (batch_size,)
+
+        #     # Compute q* (batch-wise)
+        #     q_star = (F_inv_ones / normalization.unsqueeze(-1)).squeeze(-1)  # Shape: (batch_size, top_k)
+
+        #     return q_star
+        
+        # # Compute F(h) and q* for moe_outp
+        # def compute_F_and_q_star(tensor):
+        #     # Compute F(h) using einsum
+        #     F = torch.einsum("b k d, b l d -> b k l", tensor, tensor)
+
+        #     # Compute q* for each token using F(h)
+        #     q_star = compute_q_star_batched(F, top_k=self.top_k, epsilon=1e-6)
+
+        #     return q_star
+
+        # # Compute q* for all moe_outp tensors
+        # token_q_star = tree.map_structure(compute_F_and_q_star, moe_outp)
+
+        # ###############
+
+        # # Now proceed with mixing
+        # gate_score = gate_score.view(-1, 1, self.top_k)
+
+        # def bmm_func(tensor, q_star):  # Recombine expert outputs according to gate scores and q*
+        #     dim = tensor.shape[-1]
+        #     combined_scores = (q_star.unsqueeze(-1) * gate_score).squeeze(1)  # Combine q* and g_k
+        #     tensor = torch.bmm(combined_scores, tensor).reshape(-1, dim)
+        #     return tensor
+
+        # # Apply bmm_func using token_q_star
+        # moe_outp = tree.map_structure(bmm_func, moe_outp, token_q_star)
+        
+        # def bmm_func(tensor): # recombine expert outputs according to gate scores
+        #     dim = tensor.shape[-1]
+        #     tensor = torch.bmm(gate_score, tensor).reshape(-1, dim)
+        #     return tensor
         
 
-        moe_outp = tree.map_structure(bmm_func, moe_outp)
+        # moe_outp = tree.map_structure(bmm_func, moe_outp)
         if self.slice_size > 1:
 
             def all_gather_func(tensor):
