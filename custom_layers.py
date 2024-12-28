@@ -313,76 +313,71 @@ class FMoE(nn.Module):
 
             moe_outp = tree.map_structure(view_func, fwd)
         
-        # Group outputs by experts
-        def construct_outp_by_expert(moe_outp, gate_top_k_idx, num_expert):
-            """
-            Constructs outp_by_expert from moe_outp.
+        ##### RetroMoE #####
 
+        def compute_q_star_closed_form(F_matrices, epsilon=1e-6):
+            """
+            Compute q* for all F_matrices in the batch using the closed-form solution.
             Args:
-                moe_outp (Tensor): Shape (batch_size, top_k, d_model), expert outputs for each token.
-                gate_top_k_idx (Tensor): Shape (batch_size, top_k), indices of routed experts.
-                num_expert (int): Total number of experts.
-
+                F_matrices: Tensor of shape (batch_size, top_k, top_k), pairwise similarity matrices.
+                epsilon: Small constant added to the diagonal for numerical stability.
             Returns:
-                outp_by_expert (Tensor): Shape (num_expert, batch_size, d_model), outputs grouped by expert.
+                q_star: Tensor of shape (batch_size, top_k), optimized gate scores for all tokens.
             """
-            batch_size, top_k, d_model = moe_outp.shape
-            # Initialize outp_by_expert with zeros (or another placeholder)
-            outp_by_expert = torch.zeros((num_expert, batch_size, d_model), device=moe_outp.device)
-            
-            # Mask to indicate unused token slots for each expert
-            mask = torch.zeros((num_expert, batch_size), dtype=torch.bool, device=moe_outp.device)
-            
-            # Populate outp_by_expert
-            for token_idx in range(batch_size):
-                for expert_idx, expert_id in enumerate(gate_top_k_idx[token_idx]):
-                    outp_by_expert[expert_id, token_idx] = moe_outp[token_idx, expert_idx]
-                    mask[expert_id, token_idx] = True  # Mark this slot as used
-            
-            # Set unused slots to None (or keep zeros if preferred)
-            outp_by_expert[~mask] = 0  # Use 0 as placeholder for unused slots
+            batch_size, top_k, _ = F_matrices.shape
 
-            return outp_by_expert
+            # Add epsilon to the diagonal to ensure F is invertible
+            F_perturbed = F_matrices + epsilon * torch.eye(top_k, device=F_matrices.device).unsqueeze(0)
+
+            # Compute F^{-1} (batch-wise matrix inverse)
+            F_inv = torch.linalg.inv(F_perturbed)  # Shape: (batch_size, top_k, top_k)
+
+            # Compute F^{-1} * 1 (vector of ones)
+            ones = torch.ones(top_k, 1, device=F_matrices.device)  # Shape: (top_k, 1)
+            F_inv_ones = torch.bmm(F_inv, ones)  # Shape: (batch_size, top_k, 1)
+
+            # Compute 1^T * F^{-1} * 1 (normalization factor)
+            normalization = torch.bmm(ones.transpose(0, 1), F_inv_ones).squeeze(-1).squeeze(-1)  # Shape: (batch_size,)
+
+            # Compute q* (batch-wise)
+            q_star = (F_inv_ones / normalization.unsqueeze(-1)).squeeze(-1)  # Shape: (batch_size, top_k)
+
+            return q_star
         
-        # DEFINE outp_by_expert
-        outp_by_expert = construct_outp_by_expert(moe_outp, gate_top_k_idx, self.num_expert)
+        # Compute F(h) and q* for moe_outp
+        def compute_F_and_q_star(tensor):
+            # Compute F(h) using einsum
+            F = torch.einsum("b k d, b l d -> b k l", tensor, tensor)
 
+            # Compute q* for each token using F(h)
+            q_star = compute_q_star_batched(F, top_k=self.top_k, epsilon=1e-6)
 
-        # INIT: tensor F of shape (E, E), fill with zeros first
-        F = torch.zeros(self.num_expert, self.num_expert)
+            return q_star
 
-        # POPULATE: F_ij = E[f_i(h)^T f_j(h)] as follows:
-        for i in range(self.num_expert):
-            for j in range(i, self.num_expert):  # Exploit symmetry of F
-                # Step 1: Extract outputs for experts i and j
-                # f_i and f_j are tensors of shape (b_size, d_model) for the i-th and j-th experts
-                f_i = outp_by_expert[i]  # Shape: (b_size, d_model)
-                f_j = outp_by_expert[j]  # Shape: (b_size, d_model)
+        # Compute q* for all moe_outp tensors
+        token_q_star = tree.map_structure(compute_F_and_q_star, moe_outp)
 
-                # Step 2: Compute row-wise dot product
-                # A token is valid if its norm is greater than zero
-                valid_mask = (f_i.norm(dim=1) > 0) & (f_j.norm(dim=1) > 0)  # Shape: (b_size,)
-                dot_products = torch.einsum('nd,nd->n', f_i, f_j)  # Shape: (b_size,)
-
-                # Step 3: Apply the mask and compute the mean
-                valid_dot_products = dot_products[valid_mask]
-                average_dot_product = valid_dot_products.mean() if valid_dot_products.numel() > 0 else 0.0
-
-                # Step 4: Update F_ij and exploit symmetry
-                F[i, j] = average_dot_product
-                if i != j:
-                    F[j, i] = F[i, j]
+        ###############
 
         # Now proceed with mixing
         gate_score = gate_score.view(-1, 1, self.top_k)
-        
-        def bmm_func(tensor): # recombine expert outputs according to gate scores
+
+        def bmm_func(tensor, q_star):  # Recombine expert outputs according to gate scores and q*
             dim = tensor.shape[-1]
-            tensor = torch.bmm(gate_score, tensor).reshape(-1, dim)
+            combined_scores = (q_star.unsqueeze(-1) * gate_score).squeeze(1)  # Combine q* and g_k
+            tensor = torch.bmm(combined_scores, tensor).reshape(-1, dim)
             return tensor
+
+        # Apply bmm_func using token_q_star
+        moe_outp = tree.map_structure(bmm_func, moe_outp, token_q_star)
+        
+        # def bmm_func(tensor): # recombine expert outputs according to gate scores
+        #     dim = tensor.shape[-1]
+        #     tensor = torch.bmm(gate_score, tensor).reshape(-1, dim)
+        #     return tensor
         
 
-        moe_outp = tree.map_structure(bmm_func, moe_outp)
+        # moe_outp = tree.map_structure(bmm_func, moe_outp)
         if self.slice_size > 1:
 
             def all_gather_func(tensor):
